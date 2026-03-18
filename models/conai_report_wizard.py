@@ -131,10 +131,11 @@ class ConaiKgReportWizard(models.TransientModel):
         return {
             "type": "ir.actions.act_window",
             "name": "Report CONAI Kg",
-            "res_model": "conai.kg.report.wizard",
-            "view_mode": "form",
-            "res_id": self.id,
-            "target": "new",
+            "res_model": "conai.kg.report.line",
+            "view_mode": "list,pivot",
+            "target": "current",
+            "domain": [("wizard_id", "=", self.id)],
+            "context": {"group_by": ["fascia_id"]},
         }
 
 

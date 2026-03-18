@@ -21,19 +21,19 @@
     </field>
   </record>
 
-  <!-- Tree delle righe report (raggruppabile per fascia) -->
-  <record id="view_conai_kg_report_line_tree" model="ir.ui.view">
-    <field name="name">conai.kg.report.line.tree</field>
+  <!-- LIST delle righe report (Odoo 18: usare <list>, non <tree>) -->
+  <record id="view_conai_kg_report_line_list" model="ir.ui.view">
+    <field name="name">conai.kg.report.line.list</field>
     <field name="model">conai.kg.report.line</field>
     <field name="arch" type="xml">
-      <tree default_group_by="fascia_id">
+      <list default_group_by="fascia_id">
         <field name="fascia_id"/>
         <field name="partner_id"/>
         <field name="kg_conai" sum="Kg CONAI"/>
         <field name="kg_esenzione" sum="Kg Esenzione"/>
         <field name="kg_assoggettati" sum="Kg Assoggettati"/>
         <field name="amount" sum="Tot Importo"/>
-      </tree>
+      </list>
     </field>
   </record>
 
