@@ -31,10 +31,15 @@ class ConaiKgReportWizard(models.TransientModel):
         self.env["conai.kg.report.line"].search([("wizard_id", "=", self.id)]).unlink()
 
         conai_product = self.env["product.product"].search([("default_code", "=", CONAI_DEFAULT_CODE)], limit=1)
-        _logger.info("CONAI_REPORT: start company=%s date_from=%s date_to=%s conai_product_id=%s",
-                     self.company_id.id, self.date_from, self.date_to, conai_product.id if conai_product else None)
+        _logger.info(
+            "CONAI_REPORT: start company=%s date_from=%s date_to=%s conai_product_id=%s",
+            self.company_id.id,
+            self.date_from,
+            self.date_to,
+            conai_product.id if conai_product else None
+        )
 
-        # 🔥 FIX: prendo le fatture postate nel periodo usando invoice_date OR date (accounting date)
+        # Fatture postate nel periodo usando invoice_date OR date (accounting date)
         Move = self.env["account.move"]
         moves_domain = [
             ("state", "=", "posted"),
@@ -53,7 +58,7 @@ class ConaiKgReportWizard(models.TransientModel):
                 "Nota: il report filtra per Invoice Date oppure Accounting Date (date)."
             )
 
-        # Riga fattura
+        # Righe fattura
         Line = self.env["account.move.line"]
         line_domain = [
             ("move_id", "in", moves.ids),
@@ -74,7 +79,6 @@ class ConaiKgReportWizard(models.TransientModel):
 
         # Aggrego per (fascia_id, partner_id)
         agg = {}
-        # contatori debug
         skipped = {
             "no_conai_field": 0,
             "no_fascia": 0,
