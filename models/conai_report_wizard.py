@@ -1,6 +1,5 @@
 import logging
 import re
-
 from odoo import fields, models
 from odoo.exceptions import UserError
 from odoo.tools.float_utils import float_round
@@ -10,7 +9,7 @@ _logger = logging.getLogger(__name__)
 
 class ConaiKgReportWizard(models.TransientModel):
     _name = "conai.kg.report.wizard"
-    _description = "Wizard Report CONAI (da importi fatturati) per Fascia/Cliente"
+    _description = "Wizard Report CONAI Kg per Fascia/Cliente"
 
     date_from = fields.Date(required=True, default=fields.Date.context_today)
     date_to = fields.Date(required=True, default=fields.Date.context_today)
@@ -18,20 +17,15 @@ class ConaiKgReportWizard(models.TransientModel):
 
     def _find_base_product_from_conai_line(self, conai_aml, conai_product):
         """
-        Risale al prodotto 'origine' a partire dalla riga fattura CONAI.
-
-        Strategia 1 (robusta): usa sale_line_ids -> order_id -> trova la riga prodotto precedente per sequence.
-        Fallback: prova a parsare il nome "Contributo ambientale CONAI per XXX" e fare name_search sul prodotto.
+        Vecchia logica:
+        1) sale_line_ids -> order_line precedente
+        2) fallback parsing del nome riga CONAI
         """
-        # --- Strategia 1: sale_line_ids (fattura da ordine) ---
-        sale_lines = getattr(conai_aml, "sale_line_ids", False)
-        if sale_lines:
-            # prendo la prima sale line "conai"
-            sl = sale_lines[0]
-            order = getattr(sl, "order_id", False)
-            if order:
+        if 'sale_line_ids' in conai_aml._fields and conai_aml.sale_line_ids:
+            sl = conai_aml.sale_line_ids[0]
+            if 'order_id' in sl._fields and sl.order_id:
+                order = sl.order_id
                 conai_seq = sl.sequence or 0
-                # prendo la riga prodotto con sequence più alta ma < conai_seq (skip note/section + righe CONAI)
                 candidates = order.order_line.filtered(
                     lambda l: (not l.display_type)
                     and l.product_id
@@ -42,25 +36,19 @@ class ConaiKgReportWizard(models.TransientModel):
                 if candidates:
                     return candidates[0].product_id
 
-        # --- Fallback: parse del nome della riga ---
         name = (conai_aml.name or "").strip()
         if name:
-            # prendo prima riga testo
             first_line = name.splitlines()[0].strip()
-            # rimuovo prefisso noto
             prefix = "Contributo ambientale CONAI per "
             if first_line.startswith(prefix):
                 prod_txt = first_line[len(prefix):].strip()
             else:
-                # prova regex "per XXX"
                 m = re.search(r"\bper\s+(.*)$", first_line)
                 prod_txt = m.group(1).strip() if m else ""
 
             if prod_txt:
-                # name_search su product.product
                 res = self.env["product.product"].name_search(prod_txt, operator="ilike", limit=5)
                 if res:
-                    # se troviamo un match, prendo il primo
                     return self.env["product.product"].browse(res[0][0])
 
         return False
@@ -71,26 +59,27 @@ class ConaiKgReportWizard(models.TransientModel):
         if self.date_from and self.date_to and self.date_from > self.date_to:
             raise UserError("Intervallo date non valido: 'Dal' è successivo a 'Al'.")
 
-        # ====== CONFIG ======
-        ESENZIONE_PCT_FIELD = "x_studio_esenzione_conai_percentuale"  # su res.partner
-        CONAI_M2O_FIELD = "x_studio_fascia_conai"                     # su product.product -> x_conai
-        TARIFFA_TON_FIELD = "x_studio_tariffa_ton"                    # €/ton su x_conai
-        CONAI_DEFAULT_CODE = "CONAI"                                  # default_code articolo CONAI
-        # ====================
+        CONAI_DEFAULT_CODE = "CONAI"
+        CONAI_M2O_FIELD = "x_studio_fascia_conai"
+        TARIFFA_TON_FIELD = "x_studio_tariffa_ton"
 
-        # pulizia righe report precedenti (wizard)
+        SNAP_FASCIA_FIELD = "x_studio_conai_fascia_snapshot_id"
+        SNAP_TARIFFA_TON_FIELD = "x_studio_conai_tariffa_ton_snapshot"
+        SNAP_ESENZIONE_PCT_FIELD = "x_studio_conai_esenzione_pct_snapshot"
+
+        GO_LIVE_DATE = fields.Date.to_date("2026-03-19")
+
         self.env["conai.kg.report.line"].search([("wizard_id", "=", self.id)]).unlink()
 
         conai_product = self.env["product.product"].search([("default_code", "=", CONAI_DEFAULT_CODE)], limit=1)
         if not conai_product:
-            raise UserError(f"Prodotto CONAI non trovato (default_code='{CONAI_DEFAULT_CODE}').")
+            raise UserError("Prodotto CONAI non trovato (default_code='CONAI').")
 
         _logger.info(
-            "CONAI_REPORT_INV: start company=%s date_from=%s date_to=%s conai_product_id=%s",
+            "CONAI_REPORT: start company=%s date_from=%s date_to=%s conai_product_id=%s",
             self.company_id.id, self.date_from, self.date_to, conai_product.id
         )
 
-        # fatture/NC postate nel periodo: invoice_date OR date
         Move = self.env["account.move"]
         moves_domain = [
             ("state", "=", "posted"),
@@ -101,103 +90,133 @@ class ConaiKgReportWizard(models.TransientModel):
             "&", ("date", ">=", self.date_from), ("date", "<=", self.date_to),
         ]
         moves = Move.search(moves_domain)
-        _logger.info("CONAI_REPORT_INV: moves found=%s", len(moves))
+        _logger.info("CONAI_REPORT: moves found=%s", len(moves))
 
         if not moves:
             raise UserError(
                 "Nessuna fattura/NC POSTATA trovata nel periodo.\n"
-                "Nota: il report filtra per Invoice Date oppure Accounting Date (date)."
+                "Il report filtra per Invoice Date oppure Accounting Date."
             )
 
-        # prendo SOLO le righe fattura del prodotto CONAI (importi reali fatturati)
         Line = self.env["account.move.line"]
-        conai_line_domain = [
+        line_domain = [
             ("move_id", "in", moves.ids),
             ("product_id", "=", conai_product.id),
         ]
         if "exclude_from_invoice_tab" in Line._fields:
-            conai_line_domain.append(("exclude_from_invoice_tab", "=", False))
+            line_domain.append(("exclude_from_invoice_tab", "=", False))
 
-        conai_amls = Line.search(conai_line_domain)
-        _logger.info("CONAI_REPORT_INV: conai invoice lines found=%s", len(conai_amls))
+        conai_lines = Line.search(line_domain)
+        _logger.info("CONAI_REPORT: conai invoice lines found=%s", len(conai_lines))
 
-        if not conai_amls:
-            raise UserError(
-                "Nel periodo non risultano righe fattura con prodotto CONAI.\n"
-                "Se il CONAI è presente solo su preventivo/ordine ma non è stato fatturato, qui non apparirà."
-            )
+        if not conai_lines:
+            raise UserError("Nel periodo non risultano righe fattura con prodotto CONAI.")
 
         agg = {}
         problems = []
+        used_new = 0
+        used_old = 0
 
-        for conai_aml in conai_amls:
-            move = conai_aml.move_id
+        for line in conai_lines:
+            move = line.move_id
             partner = move.partner_id
+            doc_date = move.invoice_date or move.date
 
-            base_product = self._find_base_product_from_conai_line(conai_aml, conai_product)
-            if not base_product:
-                problems.append(
-                    f"- Fattura {move.name} (id {move.id}) riga CONAI id {conai_aml.id}: "
-                    f"impossibile risalire al prodotto origine (manca sale_line_ids e parsing name fallito)."
-                )
-                continue
-
-            # fascia su prodotto origine
-            if CONAI_M2O_FIELD not in base_product._fields:
-                problems.append(
-                    f"- Prodotto {base_product.display_name} (id {base_product.id}) non ha il campo {CONAI_M2O_FIELD}."
-                )
-                continue
-
-            fascia = base_product[CONAI_M2O_FIELD]
-            if not fascia:
-                problems.append(
-                    f"- Prodotto {base_product.display_name} (id {base_product.id}) senza fascia CONAI."
-                )
-                continue
-
-            # tariffa fascia
-            if TARIFFA_TON_FIELD not in fascia._fields:
-                problems.append(
-                    f"- Fascia {fascia.display_name} (id {fascia.id}) senza campo {TARIFFA_TON_FIELD}."
-                )
-                continue
-
-            tariffa_ton = fascia[TARIFFA_TON_FIELD] or 0.0
-            if not tariffa_ton:
-                problems.append(
-                    f"- Fascia {fascia.display_name} (id {fascia.id}) tariffa €/ton nulla."
-                )
-                continue
-
-            tariffa_kg = tariffa_ton / 1000.0
-
-            # IMPORTO REALE FATTURATO (tax excluded) -> è quello che vuoi far tornare 1:1
-            amount = conai_aml.price_subtotal  # in valuta fattura, con segno corretto
+            amount = line.price_subtotal or 0.0
             if not amount:
                 continue
 
-            # kg assoggettati derivati dall'importo fatturato e tariffa (coerente con importi)
-            kg_assogg = amount / tariffa_kg if tariffa_kg else 0.0
+            use_new_logic = False
+            if doc_date and doc_date >= GO_LIVE_DATE:
+                has_fascia = (SNAP_FASCIA_FIELD in line._fields) and bool(line[SNAP_FASCIA_FIELD])
+                has_tariffa = (SNAP_TARIFFA_TON_FIELD in line._fields) and bool(line[SNAP_TARIFFA_TON_FIELD])
+                has_esenzione_field = SNAP_ESENZIONE_PCT_FIELD in line._fields
+                if has_fascia and has_tariffa and has_esenzione_field:
+                    use_new_logic = True
 
-            # esenzione% (ATTENZIONE: è "attuale" del partner; se cambia nel tempo e non è storicizzata, può variare)
-            esenzione_pct = 0.0
-            if partner and (ESENZIONE_PCT_FIELD in partner._fields):
-                esenzione_pct = partner[ESENZIONE_PCT_FIELD] or 0.0
-            esenzione_pct = max(0.0, min(100.0, esenzione_pct))
-            fattore = 1.0 - (esenzione_pct / 100.0)
+            if use_new_logic:
+                fascia = line[SNAP_FASCIA_FIELD]
+                tariffa_ton = line[SNAP_TARIFFA_TON_FIELD] or 0.0
+                esenzione_pct = line[SNAP_ESENZIONE_PCT_FIELD] or 0.0
+                esenzione_pct = max(0.0, min(100.0, esenzione_pct))
 
-            # ricostruisco kg lordi ed esenti in modo coerente con amount
-            if fattore > 0:
-                kg_conai = kg_assogg / fattore
+                tariffa_kg = tariffa_ton / 1000.0
+                if not tariffa_kg:
+                    problems.append(
+                        "- %s riga CONAI id %s: tariffa snapshot nulla" % (move.name, line.id)
+                    )
+                    continue
+
+                kg_assogg = amount / tariffa_kg
+                fattore = 1.0 - (esenzione_pct / 100.0)
+
+                if fattore > 0:
+                    kg_conai = kg_assogg / fattore
+                    kg_esenzione = kg_conai - kg_assogg
+                else:
+                    # caso incoerente: esenzione 100% ma importo presente
+                    kg_conai = kg_assogg
+                    kg_esenzione = 0.0
+
+                used_new += 1
+
             else:
-                # esenzione 100% ma importo != 0 è incoerente: segnalo
-                problems.append(
-                    f"- Partner {partner.display_name}: esenzione 100% ma riga CONAI fatturata {amount} su {move.name}."
-                )
-                continue
+                # vecchia logica
+                base_product = self._find_base_product_from_conai_line(line, conai_product)
+                if not base_product:
+                    problems.append(
+                        "- Fattura %s (id %s) riga CONAI id %s: impossibile risalire al prodotto origine "
+                        "(manca sale_line_ids e parsing name fallito)." % (move.name, move.id, line.id)
+                    )
+                    continue
 
-            kg_esente = kg_conai - kg_assogg
+                if CONAI_M2O_FIELD not in base_product._fields:
+                    problems.append(
+                        "- Fattura %s riga CONAI id %s: prodotto %s senza campo fascia CONAI." %
+                        (move.name, line.id, base_product.display_name)
+                    )
+                    continue
+
+                fascia = base_product[CONAI_M2O_FIELD]
+                if not fascia:
+                    problems.append(
+                        "- Fattura %s riga CONAI id %s: prodotto %s senza fascia CONAI." %
+                        (move.name, line.id, base_product.display_name)
+                    )
+                    continue
+
+                if TARIFFA_TON_FIELD not in fascia._fields:
+                    problems.append(
+                        "- Fattura %s riga CONAI id %s: fascia %s senza campo tariffa." %
+                        (move.name, line.id, fascia.display_name)
+                    )
+                    continue
+
+                tariffa_ton = fascia[TARIFFA_TON_FIELD] or 0.0
+                if not tariffa_ton:
+                    problems.append(
+                        "- Fattura %s riga CONAI id %s: fascia %s con tariffa nulla." %
+                        (move.name, line.id, fascia.display_name)
+                    )
+                    continue
+
+                esenzione_pct = 0.0
+                if partner and ("x_studio_esenzione_conai_percentuale" in partner._fields):
+                    esenzione_pct = partner["x_studio_esenzione_conai_percentuale"] or 0.0
+                esenzione_pct = max(0.0, min(100.0, esenzione_pct))
+
+                tariffa_kg = tariffa_ton / 1000.0
+                kg_assogg = amount / tariffa_kg
+                fattore = 1.0 - (esenzione_pct / 100.0)
+
+                if fattore > 0:
+                    kg_conai = kg_assogg / fattore
+                    kg_esenzione = kg_conai - kg_assogg
+                else:
+                    kg_conai = kg_assogg
+                    kg_esenzione = 0.0
+
+                used_old += 1
 
             key = (fascia.id, partner.id)
             if key not in agg:
@@ -211,19 +230,20 @@ class ConaiKgReportWizard(models.TransientModel):
                 }
 
             agg[key]["kg_conai"] += kg_conai
-            agg[key]["kg_esenzione"] += kg_esente
+            agg[key]["kg_esenzione"] += kg_esenzione
             agg[key]["kg_assoggettati"] += kg_assogg
             agg[key]["amount"] += amount
 
-        if problems:
-            # Mostro solo i primi per non intasare
-            msg = "Alcune righe CONAI non sono state agganciate alla fascia/prodotto:\n\n" + "\n".join(problems[:10])
-            if len(problems) > 10:
-                msg += f"\n\n(+ altre {len(problems) - 10} righe)"
-            raise UserError(msg)
+        _logger.info(
+            "CONAI_REPORT: agg keys=%s used_new=%s used_old=%s problems=%s",
+            len(agg), used_new, used_old, len(problems)
+        )
 
         if not agg:
-            raise UserError("Nessun dato aggregato: verificare fascia/tariffe e collegamenti alle righe ordine.")
+            raise UserError(
+                "Nessun dato aggregato disponibile.\n\n" +
+                ("\n".join(problems[:10]) if problems else "")
+            )
 
         vals_list = []
         for v in agg.values():
@@ -238,11 +258,15 @@ class ConaiKgReportWizard(models.TransientModel):
             })
 
         created = self.env["conai.kg.report.line"].create(vals_list)
-        _logger.info("CONAI_REPORT_INV: created lines=%s", len(created))
+        _logger.info("CONAI_REPORT: created lines=%s", len(created))
+
+        # se vuoi puoi lasciare solo log; io non blocco il report se alcune righe vecchie falliscono
+        if problems:
+            _logger.warning("CONAI_REPORT: problemi su alcune righe:\n%s", "\n".join(problems[:20]))
 
         return {
             "type": "ir.actions.act_window",
-            "name": "Report CONAI (fatturato)",
+            "name": "Report CONAI Kg",
             "res_model": "conai.kg.report.line",
             "view_mode": "list,pivot",
             "target": "current",
