@@ -1,5 +1,9 @@
-from odoo import api, fields, models
+import logging
+from odoo import fields, models
+from odoo.exceptions import UserError
 from odoo.tools.float_utils import float_round
+
+_logger = logging.getLogger(__name__)
 
 
 class ConaiKgReportWizard(models.TransientModel):
@@ -10,80 +14,123 @@ class ConaiKgReportWizard(models.TransientModel):
     date_to = fields.Date(required=True, default=fields.Date.context_today)
     company_id = fields.Many2one("res.company", required=True, default=lambda self: self.env.company)
 
-    line_ids = fields.One2many("conai.kg.report.line", "wizard_id", string="Righe Report")
-
     def action_generate(self):
         self.ensure_one()
-        self.line_ids.unlink()
 
-        # Campi custom usati nel tuo progetto
-        ESENZIONE_PCT_FIELD = "x_studio_esenzione_conai_percentuale"   # su res.partner
-        CONAI_M2O_FIELD = "x_studio_fascia_conai"                      # su product.product -> x_conai
-        TARIFFA_TON_FIELD = "x_studio_tariffa_ton"                     # su x_conai
-        CONAI_DEFAULT_CODE = "CONAI"                                   # per escludere righe prodotto CONAI
+        if self.date_from and self.date_to and self.date_from > self.date_to:
+            raise UserError("Intervallo date non valido: 'Dal' è successivo a 'Al'.")
 
-        # prodotto CONAI (per esclusione)
+        # ====== CONFIG (adatta se i nomi nel DB sono diversi) ======
+        ESENZIONE_PCT_FIELD = "x_studio_esenzione_conai_percentuale"  # su res.partner
+        CONAI_M2O_FIELD = "x_studio_fascia_conai"                     # su product.product -> x_conai
+        TARIFFA_TON_FIELD = "x_studio_tariffa_ton"                    # su x_conai
+        CONAI_DEFAULT_CODE = "CONAI"                                  # prodotto CONAI (da escludere)
+        # ==========================================================
+
+        # pulizia righe precedenti (per questo wizard)
+        self.env["conai.kg.report.line"].search([("wizard_id", "=", self.id)]).unlink()
+
         conai_product = self.env["product.product"].search([("default_code", "=", CONAI_DEFAULT_CODE)], limit=1)
+        _logger.info("CONAI_REPORT: start company=%s date_from=%s date_to=%s conai_product_id=%s",
+                     self.company_id.id, self.date_from, self.date_to, conai_product.id if conai_product else None)
 
-        # Dominio: fatture clienti + note credito, postate, nel periodo
-        domain = [
-            ("move_id.state", "=", "posted"),
-            ("move_id.move_type", "in", ("out_invoice", "out_refund")),
-            ("move_id.company_id", "=", self.company_id.id),
-            ("move_id.invoice_date", ">=", self.date_from),
-            ("move_id.invoice_date", "<=", self.date_to),
+        # 🔥 FIX: prendo le fatture postate nel periodo usando invoice_date OR date (accounting date)
+        Move = self.env["account.move"]
+        moves_domain = [
+            ("state", "=", "posted"),
+            ("move_type", "in", ("out_invoice", "out_refund")),
+            ("company_id", "=", self.company_id.id),
+            "|",
+            "&", ("invoice_date", ">=", self.date_from), ("invoice_date", "<=", self.date_to),
+            "&", ("date", ">=", self.date_from), ("date", "<=", self.date_to),
+        ]
+        moves = Move.search(moves_domain)
+        _logger.info("CONAI_REPORT: moves found=%s", len(moves))
+
+        if not moves:
+            raise UserError(
+                "Nessuna fattura/NC POSTATA trovata nel periodo.\n"
+                "Nota: il report filtra per Invoice Date oppure Accounting Date (date)."
+            )
+
+        # Riga fattura
+        Line = self.env["account.move.line"]
+        line_domain = [
+            ("move_id", "in", moves.ids),
             ("display_type", "=", False),
             ("product_id", "!=", False),
         ]
         if conai_product:
-            domain.append(("product_id", "!=", conai_product.id))
+            line_domain.append(("product_id", "!=", conai_product.id))
 
-        amls = self.env["account.move.line"].search(domain)
+        amls = Line.search(line_domain)
+        _logger.info("CONAI_REPORT: invoice lines found=%s", len(amls))
+
+        if not amls:
+            raise UserError(
+                "Fatture trovate, ma nessuna riga prodotto utile.\n"
+                "Controlla che sulle fatture ci siano righe prodotto (non note/section)."
+            )
 
         # Aggrego per (fascia_id, partner_id)
-        agg = {}  # key=(fascia_id, partner_id) -> totals
+        agg = {}
+        # contatori debug
+        skipped = {
+            "no_conai_field": 0,
+            "no_fascia": 0,
+            "no_tariff_field": 0,
+            "no_tariff": 0,
+            "no_qty": 0,
+            "no_weight": 0,
+        }
 
         for line in amls:
             move = line.move_id
             partner = move.partner_id
             product = line.product_id
 
-            # Fascia CONAI sul prodotto
+            # fascia su prodotto
             if CONAI_M2O_FIELD not in product._fields:
+                skipped["no_conai_field"] += 1
                 continue
             fascia = product[CONAI_M2O_FIELD]
             if not fascia:
+                skipped["no_fascia"] += 1
                 continue
 
-            # Tariffa €/ton sulla fascia
+            # tariffa €/ton su fascia
             if TARIFFA_TON_FIELD not in fascia._fields:
+                skipped["no_tariff_field"] += 1
                 continue
             tariffa_ton = fascia[TARIFFA_TON_FIELD] or 0.0
             if not tariffa_ton:
+                skipped["no_tariff"] += 1
                 continue
             tariffa_kg = tariffa_ton / 1000.0
 
-            # Quantità: converto nella UoM prodotto per coerenza col "peso per 1 unità prodotto"
+            # qty (convertita in UoM prodotto)
             qty = line.quantity or 0.0
-            if qty and hasattr(line, "product_uom_id") and line.product_uom_id and product.uom_id:
+            if qty and getattr(line, "product_uom_id", False) and line.product_uom_id and product.uom_id:
                 qty = line.product_uom_id._compute_quantity(qty, product.uom_id)
-
             if not qty:
+                skipped["no_qty"] += 1
                 continue
 
-            # Peso unitario: variante -> fallback template (uniforme come CONAI)
+            # peso unitario uniforme: variante -> fallback template
             peso_unit_kg = product.weight or product.product_tmpl_id.weight or 0.0
             if not peso_unit_kg:
+                skipped["no_weight"] += 1
                 continue
 
-            # Note di credito: segno negativo
+            # note credito negative
             sign = -1.0 if move.move_type == "out_refund" else 1.0
 
             kg_lordi = sign * (qty * peso_unit_kg)
             if not kg_lordi:
+                skipped["no_qty"] += 1
                 continue
 
-            # Esenzione % cliente (0..100)
+            # esenzione % cliente
             esenzione_pct = 0.0
             if partner and (ESENZIONE_PCT_FIELD in partner._fields):
                 esenzione_pct = partner[ESENZIONE_PCT_FIELD] or 0.0
@@ -91,8 +138,6 @@ class ConaiKgReportWizard(models.TransientModel):
 
             kg_esente = kg_lordi * (esenzione_pct / 100.0)
             kg_assogg = kg_lordi - kg_esente
-
-            # Importi (coerenti col tuo calcolo server action)
             amount = kg_assogg * tariffa_kg
 
             key = (fascia.id, partner.id)
@@ -111,23 +156,33 @@ class ConaiKgReportWizard(models.TransientModel):
             agg[key]["kg_assoggettati"] += kg_assogg
             agg[key]["amount"] += amount
 
-        # Creo righe report
+        _logger.info("CONAI_REPORT: agg keys=%s skipped=%s", len(agg), skipped)
+
+        if not agg:
+            raise UserError(
+                "Nessun dato CONAI calcolabile nel periodo.\n\n"
+                f"Righe fattura analizzate: {len(amls)}\n"
+                f"Skip: no campo fascia={skipped['no_conai_field']}, no fascia={skipped['no_fascia']}, "
+                f"no campo tariffa={skipped['no_tariff_field']}, tariffa=0={skipped['no_tariff']}, "
+                f"qty=0={skipped['no_qty']}, peso=0={skipped['no_weight']}\n\n"
+                "Controlla: prodotti con fascia CONAI valorizzata, tariffa fascia valorizzata, peso prodotto."
+            )
+
         vals_list = []
-        for data in agg.values():
+        for v in agg.values():
             vals_list.append({
                 "wizard_id": self.id,
-                "fascia_id": data["fascia_id"],
-                "partner_id": data["partner_id"],
-                "kg_conai": float_round(data["kg_conai"], precision_digits=3),
-                "kg_esenzione": float_round(data["kg_esenzione"], precision_digits=3),
-                "kg_assoggettati": float_round(data["kg_assoggettati"], precision_digits=3),
-                "amount": float_round(data["amount"], precision_digits=2),
+                "fascia_id": v["fascia_id"],
+                "partner_id": v["partner_id"],
+                "kg_conai": float_round(v["kg_conai"], precision_digits=3),
+                "kg_esenzione": float_round(v["kg_esenzione"], precision_digits=3),
+                "kg_assoggettati": float_round(v["kg_assoggettati"], precision_digits=3),
+                "amount": float_round(v["amount"], precision_digits=2),
             })
 
-        if vals_list:
-            self.env["conai.kg.report.line"].create(vals_list)
+        created = self.env["conai.kg.report.line"].create(vals_list)
+        _logger.info("CONAI_REPORT: created lines=%s", len(created))
 
-        # Riapro wizard (con tab righe)
         return {
             "type": "ir.actions.act_window",
             "name": "Report CONAI Kg",
@@ -137,21 +192,3 @@ class ConaiKgReportWizard(models.TransientModel):
             "domain": [("wizard_id", "=", self.id)],
             "context": {"group_by": ["fascia_id"]},
         }
-
-
-class ConaiKgReportLine(models.TransientModel):
-    _name = "conai.kg.report.line"
-    _description = "Riga Report CONAI Kg"
-
-    wizard_id = fields.Many2one("conai.kg.report.wizard", required=True, ondelete="cascade")
-
-    # x_conai è il modello della tua fascia (da commento nel codice precedente)
-    fascia_id = fields.Many2one("x_conai", string="Fascia CONAI", required=True)
-    partner_id = fields.Many2one("res.partner", string="Cliente", required=True)
-
-    kg_conai = fields.Float(string="Kg CONAI", digits=(16, 3))
-    kg_esenzione = fields.Float(string="Kg Esenzione", digits=(16, 3))
-    kg_assoggettati = fields.Float(string="Kg Assoggettati", digits=(16, 3))
-    amount = fields.Monetary(string="Tot Importo", currency_field="currency_id")
-
-    currency_id = fields.Many2one("res.currency", default=lambda self: self.env.company.currency_id)
