@@ -20,12 +20,12 @@ class ConaiKgReportWizard(models.TransientModel):
         if self.date_from and self.date_to and self.date_from > self.date_to:
             raise UserError("Intervallo date non valido: 'Dal' è successivo a 'Al'.")
 
-        # ====== CONFIG (adatta se i nomi nel DB sono diversi) ======
+        # ====== CONFIG ======
         ESENZIONE_PCT_FIELD = "x_studio_esenzione_conai_percentuale"  # su res.partner
         CONAI_M2O_FIELD = "x_studio_fascia_conai"                     # su product.product -> x_conai
         TARIFFA_TON_FIELD = "x_studio_tariffa_ton"                    # su x_conai
         CONAI_DEFAULT_CODE = "CONAI"                                  # prodotto CONAI (da escludere)
-        # ==========================================================
+        # ====================
 
         # pulizia righe precedenti (per questo wizard)
         self.env["conai.kg.report.line"].search([("wizard_id", "=", self.id)]).unlink()
@@ -55,31 +55,45 @@ class ConaiKgReportWizard(models.TransientModel):
         if not moves:
             raise UserError(
                 "Nessuna fattura/NC POSTATA trovata nel periodo.\n"
-                "Nota: il report filtra per Invoice Date oppure Accounting Date (date)."
+                "Nota: il report filtra per Invoice Date oppure Accounting Date (date).\n"
+                "Se le fatture sono state inviate di recente ma hanno data contabile precedente, allarga il range."
             )
 
-        # Righe fattura
+        # Righe fattura: FIX Odoo18 -> NON filtrare display_type a False (può essere 'product')
         Line = self.env["account.move.line"]
         line_domain = [
             ("move_id", "in", moves.ids),
-            ("display_type", "=", False),
             ("product_id", "!=", False),
         ]
+        # opzionale: escludi righe tecniche non in tab fattura, se il campo esiste
+        if "exclude_from_invoice_tab" in Line._fields:
+            line_domain.append(("exclude_from_invoice_tab", "=", False))
+
         if conai_product:
             line_domain.append(("product_id", "!=", conai_product.id))
 
         amls = Line.search(line_domain)
-        _logger.info("CONAI_REPORT: invoice lines found=%s", len(amls))
+        _logger.info("CONAI_REPORT: invoice lines (product) found=%s", len(amls))
 
         if not amls:
+            # log extra per capire se il problema è solo display_type o product_id assente
+            all_lines = Line.search([("move_id", "in", moves.ids)])
+            _logger.info(
+                "CONAI_REPORT: DEBUG total move lines=%s, with product=%s",
+                len(all_lines),
+                len(all_lines.filtered(lambda l: bool(l.product_id)))
+            )
             raise UserError(
                 "Fatture trovate, ma nessuna riga prodotto utile.\n"
-                "Controlla che sulle fatture ci siano righe prodotto (non note/section)."
+                "Possibili cause:\n"
+                "- le righe fattura non hanno prodotto (product_id vuoto)\n"
+                "- oppure sono solo righe CONAI (escluse dal report)\n"
             )
 
         # Aggrego per (fascia_id, partner_id)
         agg = {}
         skipped = {
+            "section_or_note": 0,
             "no_conai_field": 0,
             "no_fascia": 0,
             "no_tariff_field": 0,
@@ -89,6 +103,11 @@ class ConaiKgReportWizard(models.TransientModel):
         }
 
         for line in amls:
+            # skip note/section (in Odoo18 le righe prodotto possono essere display_type='product')
+            if line.display_type in ("line_section", "line_note"):
+                skipped["section_or_note"] += 1
+                continue
+
             move = line.move_id
             partner = move.partner_id
             product = line.product_id
@@ -120,7 +139,7 @@ class ConaiKgReportWizard(models.TransientModel):
                 skipped["no_qty"] += 1
                 continue
 
-            # peso unitario uniforme: variante -> fallback template
+            # peso unitario: variante -> fallback template
             peso_unit_kg = product.weight or product.product_tmpl_id.weight or 0.0
             if not peso_unit_kg:
                 skipped["no_weight"] += 1
@@ -128,7 +147,6 @@ class ConaiKgReportWizard(models.TransientModel):
 
             # note credito negative
             sign = -1.0 if move.move_type == "out_refund" else 1.0
-
             kg_lordi = sign * (qty * peso_unit_kg)
             if not kg_lordi:
                 skipped["no_qty"] += 1
@@ -166,7 +184,8 @@ class ConaiKgReportWizard(models.TransientModel):
             raise UserError(
                 "Nessun dato CONAI calcolabile nel periodo.\n\n"
                 f"Righe fattura analizzate: {len(amls)}\n"
-                f"Skip: no campo fascia={skipped['no_conai_field']}, no fascia={skipped['no_fascia']}, "
+                f"Skip: section/note={skipped['section_or_note']}, "
+                f"no campo fascia={skipped['no_conai_field']}, no fascia={skipped['no_fascia']}, "
                 f"no campo tariffa={skipped['no_tariff_field']}, tariffa=0={skipped['no_tariff']}, "
                 f"qty=0={skipped['no_qty']}, peso=0={skipped['no_weight']}\n\n"
                 "Controlla: prodotti con fascia CONAI valorizzata, tariffa fascia valorizzata, peso prodotto."
